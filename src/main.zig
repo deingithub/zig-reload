@@ -1,100 +1,87 @@
 const std = @import("std");
+const assert = std.debug.assert;
+const warn = std.debug.warn;
+const eql = std.mem.eql;
+
 const libc = @cImport({
     @cInclude("limits.h");
     @cInclude("sys/inotify.h");
     @cInclude("dlfcn.h");
 });
 
-// type of the reloadable function
-const do_the_thing_fn = fn (u64) u64;
+const libreload_api_struct = @import("libreload.zig").Api;
 
 // inotify related constants
-const bufsize = @sizeOf(c_int) + @sizeOf(u32) * 3 + libc.NAME_MAX + 1;
+const inotify_buf_size = @sizeOf(inotify_event) + libc.NAME_MAX + 1;
 const libname = "libreload.so\u{0}";
+const libpath = "../lib/libreload.so";
 
 pub fn main() !void {
-    // our persistent state
-    var value: u64 = 42;
-
     // set up inotify
     const inotify_fd = libc.inotify_init();
-    if (inotify_fd < 0) {
-        return error.InotifyInitFailure;
-    }
-    defer std.os.close(inotify_fd);
+    if (inotify_fd < 0) return error.InotifyInitFailure;
 
-    var inotify_wd = libc.inotify_add_watch(inotify_fd, "./zig-cache/lib", libc.IN_MOVED_TO);
-    if (inotify_wd < 0) {
-        return error.InotifyWatchFailure;
-    }
+    const inotify_file = std.fs.File{ .handle = inotify_fd, .io_mode = std.io.mode };
+    defer inotify_file.close();
+
+    var inotify_wd = libc.inotify_add_watch(inotify_fd, "../lib", libc.IN_MOVED_TO);
+    if (inotify_wd < 0) return error.InotifyWatchFailure;
 
     // set up libdl
-    errdefer std.debug.warn("{s}\n", .{@ptrCast([*:0]u8, libc.dlerror())});
-
-    var handle = libc.dlopen("libreload.so", libc.RTLD_NOW) orelse return error.DlOpenFailure;
-    var c_pointer = libc.dlsym(handle, "do_the_thing") orelse return error.DlSymFailure;
-    var do_the_thing = @ptrCast(do_the_thing_fn, c_pointer);
+    errdefer warn("{s}\n", .{@ptrCast([*:0]u8, libc.dlerror())});
+    var handle = libc.dlopen(libpath, libc.RTLD_NOW) orelse return error.DlOpenFailure;
+    var Api = @ptrCast(
+        *libreload_api_struct,
+        @alignCast(8, libc.dlsym(handle, "LIBRELOAD_API") orelse return error.DlSymFailure),
+    );
 
     // initial run of reloadable function
-    value = do_the_thing(value);
-    std.debug.warn("value after running with fourty-two: {}\n", .{value});
+    var value = Api.initialize.*();
+    warn("initialized: {}\n", .{value});
 
-    var buf: [bufsize]u8 = [_]u8{0} ** bufsize;
+    var buf: [inotify_buf_size]u8 = [_]u8{0} ** inotify_buf_size;
+    var inotify_in_stream = inotify_file.inStream();
     while (true) {
-        const size = try std.os.read(inotify_fd, &buf);
+        const bytes_read = try inotify_in_stream.stream.read(&buf);
+        var cursor: usize = 0;
 
-        var cursor: u32 = 0;
-        while (cursor < size) {
-            const data = unwrap_event(buf[cursor..]);
+        while (cursor < bytes_read) {
+            const mask_offset = cursor + @sizeOf(c_int);
+            const cookie_offset = mask_offset + @sizeOf(u32);
+            const len_offset = cookie_offset + @sizeOf(u32);
+            const name_offset = len_offset + @sizeOf(u32);
 
-            // ignore non-update events and events not caused by the library symlink we want
-            if (data.mask & libc.IN_MOVED_TO != 0 and std.mem.eql(u8, data.name[0..libname.len], libname)) {
-                std.debug.warn("Updated!\n", .{});
+            const event = inotify_event{
+                .wd = std.mem.readIntSliceNative(c_int, buf[cursor..mask_offset]),
+                .mask = std.mem.readIntSliceNative(u32, buf[mask_offset..cookie_offset]),
+                .cookie = std.mem.readIntSliceNative(u32, buf[cookie_offset..len_offset]),
+                .len = std.mem.readIntSliceNative(u32, buf[len_offset..name_offset]),
+            };
+            const filename = if (event.len > 0) buf[name_offset .. name_offset + event.len - 1 :0] else null;
 
+            assert(event.wd == inotify_wd);
+            cursor += @sizeOf(inotify_event) + event.len;
+
+            if (event.mask & libc.IN_MOVED_TO != 0 and eql(u8, filename.?[0..libname.len], libname)) {
                 if (libc.dlclose(handle) != 0) {
                     return error.DLCloseFailure;
                 }
-                handle = libc.dlopen("libreload.so", libc.RTLD_NOW) orelse return error.DlOpenFailure;
-                c_pointer = libc.dlsym(handle, "do_the_thing") orelse return error.DlSymFailure;
-                do_the_thing = @ptrCast(do_the_thing_fn, c_pointer);
+                handle = libc.dlopen(libpath, libc.RTLD_NOW) orelse return error.DlOpenFailure;
+                Api = @ptrCast(
+                    *libreload_api_struct,
+                    @alignCast(8, libc.dlsym(handle, "LIBRELOAD_API") orelse return error.DlSymFailure),
+                );
 
-                value = do_the_thing(value);
-
-                std.debug.warn("value: {}\n", .{value});
+                value = Api.function.*(value);
+                warn("value: {}\n", .{value});
             }
-
-            cursor += data.memsize;
         }
     }
 }
 
-// curse you, variable sized structs.
-// the returned workaround zig struct is only valid for the life-time of the data
-// in the buffer it was created from.
-fn unwrap_event(buf: []const u8) inotify_event {
-    const wd_offset = 0;
-    const mask_offset = wd_offset + @sizeOf(c_int);
-    const cookie_offset = mask_offset + @sizeOf(u32);
-    const len_offset = cookie_offset + @sizeOf(u32);
-    const name_offset = len_offset + @sizeOf(u32);
-
-    // the @bytesToSlice calls instead of @bitCast are a workaround for ziglang/zig#3818
-    const len = @bytesToSlice(u32, buf[len_offset..name_offset])[0];
-    return .{
-        .wd = @bytesToSlice(c_int, buf[wd_offset..mask_offset])[0],
-        .mask = @bytesToSlice(u32, buf[mask_offset..cookie_offset])[0],
-        .cookie = @bytesToSlice(u32, buf[cookie_offset..len_offset])[0],
-        .len = len,
-        .name = buf[name_offset .. name_offset + len],
-        .memsize = name_offset + len,
-    };
-}
-
-const inotify_event = struct {
+const inotify_event = extern struct {
     wd: c_int,
     mask: u32,
     cookie: u32,
     len: u32,
-    name: []const u8,
-    memsize: u32,
 };

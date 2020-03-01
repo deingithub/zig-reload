@@ -5,16 +5,13 @@ pub fn build(b: *Builder) void {
     const mode = b.standardReleaseOptions();
 
     const lib = b.addSharedLibrary("reload", "src/libreload.zig", b.version(0, 0, 1));
+    lib.setDisableGenH(true);
     lib.install();
 
     const exe = b.addExecutable("run", "src/main.zig");
     exe.setBuildMode(mode);
     exe.linkSystemLibrary("c");
     exe.step.dependOn(&lib.step);
-
-    b.addNativeSystemRPath("./zig-cache/lib");
-    exe.need_system_paths = true;
-
     exe.install();
 
     const run_cmd = exe.run();
